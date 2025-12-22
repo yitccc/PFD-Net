@@ -1,5 +1,5 @@
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
-path: D:/BaiduNetdiskDownload/YOLO-multimodal/YOLO-multimodal/datasets  # 只需修改这里
+path: D:/BaiduNetdiskDownload/YOLO-multimodal/YOLO-multimodal/datasets
 
 train: images/train  # train images (relative to 'path') 128 images
 val: images/val  # val images (relative to 'path') 128 images
@@ -7,26 +7,5 @@ test:  # test images (optional)
 
 # Classes
 names:
-  0: yyzd
-  1: ygfs
-  2: zw
-  3: yyzd_zw
-  4: ns
-  5: ygfs_yyzd
-  6: yyzd_ns
-  7: zw_ns
-  8: gfbzjbx
-  9: gfbqs
-  10: mbsl
-  11: dyrb
-  12: dmjrb
-  13: dyrb_ycdw
-  14: dmjrb_ycdw
-  15: ycdw
-  16: dyrb_zd
-  17: zd_hw
-  18: dmjrb_zd
-  19: ycdw_zd
-  20: ejgdl
-  21: ygfs_hw
-  22: ejgdl_ycdw
+  0: Fire
+  1: Smoke
