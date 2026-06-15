@@ -1,6 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-# RT-DETR-ResNet50 object detection model with P3-P5 outputs.
-
 # Parameters
 ch: 6
 nc: 80 # number of classes
