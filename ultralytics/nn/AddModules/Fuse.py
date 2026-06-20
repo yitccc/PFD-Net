@@ -64,10 +64,6 @@ class PhaseAwareFusionModule(nn.Module):
         fold = torch.nn.Fold(original_size, kernel_size=(10, 10), stride=10)
         return fold(img_x_enhanced), fold(img_y_enhanced)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class CBR(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
