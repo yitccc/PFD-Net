@@ -296,16 +296,16 @@ class WorldDetect(Detect):
 # ------------------------------------------------------------------------------------------------
 class DeFE(nn.Module):
     """
-    轻量密度图 + 纯 GPU 查询数估计：
-      - 三层 depthwise 膨胀卷积 + 通道注意力 + 1×1 投影为密度图
-      - 通过下采样二值图 + max/avg-pool 的“近似连通块计数”，完全 GPU 上完成
+    Density-aware Feature Extractor (DaFE) and Prior-Adaptive Query Inference (PAQI).
+      - DaFE: Three layers of depthwise dilated convolutions + channel attention + 1x1 projection for density map regression.
+      - PAQI: Approximate cluster counting via downsampled binarized maps and connected component analysis, executing fully on GPU.
     """
 
     def __init__(self, in_channels=256, out_size: Tuple[int, int] = (640, 640)):
         super().__init__()
         self.out_size = out_size
 
-        # 多尺度感受野 depthwise dilated conv
+        # DaFE: Multi-scale receptive field via depthwise dilated convolutions
         self.dilated_convs = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1, dilation=1, groups=in_channels),
             nn.ReLU(inplace=True),
@@ -315,7 +315,7 @@ class DeFE(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Channel attention
+        # DaFE: Lightweight squeeze-and-excitation style channel attention
         self.channel_attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, in_channels // 4, 1),
@@ -324,82 +324,80 @@ class DeFE(nn.Module):
             nn.Sigmoid()
         )
 
-        # 投影为密度图
+        # DaFE: Project to a single-channel density map
         self.density_head = nn.Conv2d(in_channels, 1, 3, padding=1)
-
-
 
     @torch.no_grad()
     def _estimate_queries_gpu(
             self,
             D: torch.Tensor,  # [B,1,H,W] in [0,1]
             K_N: int = 10, K_M: int = 300,
-            q: float = 0.7,
+            q: float = 0.8,
             down: int = 4,
             grid_eps: int = 20,
             beta: float = 1.0
     ):
         """
-        近似聚类计数（按原文描述）：
-          1) 平滑密度图
-          2) 聚类（使用DBSCAN或8邻域连通域算法）
-          3) 分位数阈值筛选
-          4) 连通域分析，统计有效查询区域
+        PAQI Core Implementation (Approximate cluster counting as described in the manuscript):
+          1) Density Smoothing: Reduce local noise in the predicted density map.
+          2) Spatial Clustering: Extract target clusters using DBSCAN.
+          3) Quantile Thresholding: Isolate high-response foreground regions.
+          4) Connected Component Analysis: Map isolated regions to the dynamic query budget K.
         """
         B, _, H, W = D.shape
         device = D.device
 
-        # 1) 密度平滑（减少噪声）
+        # 1) Density Smoothing (noise reduction)
         X = F.avg_pool2d(D, kernel_size=down, stride=down) if down > 1 else D  # [B,1,h,w]
-        Bh, Bw = X.shape[2], X.shape[3]  # 下采样后的高度与宽度
+        Bh, Bw = X.shape[2], X.shape[3]  # Height and width after downsampling
 
-        # 2) 聚类
-        # 将密度图X展平为二维
+        # 2) Spatial Clustering
+        # Flatten the density map X into 2D
         flat = X.view(B, -1)
         X_flat = flat.cpu().numpy()
-        # 使用0替换NaN
-        X_flat = np.nan_to_num(X_flat, nan=0.0)  # 使用 numpy 的 nan_to_num
+        # Replace NaN with 0 for numerical stability
+        X_flat = np.nan_to_num(X_flat, nan=0.0)  
 
-        # 使用DBSCAN进行聚类，假设是使用欧氏距离
-        db = DBSCAN(eps=grid_eps, min_samples=20).fit(X_flat)  # DBSCAN聚类
-        labels = db.labels_  # 获取每个点的簇标签
+        # Perform DBSCAN clustering (assuming Euclidean distance)
+        db = DBSCAN(eps=grid_eps, min_samples=20).fit(X_flat)  
+        labels = db.labels_  # Retrieve cluster labels for each point
 
-        # 获取每个簇的响应数目
+        # Obtain the number of unique responses (clusters)
         unique_labels = np.unique(labels)
         n_clusters = len(unique_labels)
 
-        # 3) 分位数阈值二值化
+        # 3) Quantile Thresholding and Binarization
         thr = torch.quantile(flat, q, dim=1, keepdim=True).view(B, 1, 1, 1)
-        Mb = (X >= thr).float()  # 小于阈值的部分置为0，大于阈值的部分置为1
+        Mb = (X >= thr).float()  # Set values below threshold to 0, above to 1
 
-        # 4) 连通域分析
-        # 将二值化后的图像展平
+        # 4) Connected Component Analysis
+        # Flatten the binarized image
         Mb_flat = Mb.view(B, -1).cpu().numpy()
 
         n_clusters_list = []
         for b in range(B):
-            m = Mb_flat[b].reshape(Bh, Bw).astype(np.uint8)  # ✅ 改为下采样后的形状
+            m = Mb_flat[b].reshape(Bh, Bw).astype(np.uint8)  # ✅ Reshape to the downsampled dimensions
             num_labels, labels = cv2.connectedComponents(m)
             n_clusters_list.append(num_labels - 1)
 
-            # # 可视化每一张图像的密度图 X 和 聚类结果
-            # if b == 0:  # 只在第一个批次中显示
+            # # Visualize the density map X and clustering results for each image
+            # if b == 0:  # Display only for the first batch
             #     plt.figure(figsize=(12, 6))
             #
-            #     # 可视化密度图 X
+            #     # Visualize Density Map X
             #     plt.subplot(1, 2, 1)
-            #     plt.imshow(X[b, 0].cpu().numpy(), cmap='viridis')  # 选择第一张图像，去掉通道维度
+            #     plt.imshow(X[b, 0].cpu().numpy(), cmap='viridis')  # Select the first image, drop channel dim
             #     plt.title('Density Map (X)')
             #
-            #     # 可视化聚类结果
+            #     # Visualize Clustering Result
             #     plt.subplot(1, 2, 2)
             #     cluster_img = labels.reshape(Bh, Bw)
-            #     plt.imshow(cluster_img, cmap='tab20', interpolation='nearest')  # 使用不同的颜色区分簇
+            #     plt.imshow(cluster_img, cmap='tab20', interpolation='nearest')  # Use distinct colors for clusters
             #     plt.title('Clustering Result')
             #
             #     plt.show()
 
-        # 计算每个图像的查询数K
+        # Calculate the dynamic query budget K for each image
         n_clusters_tensor = torch.tensor(n_clusters_list, device=device)
         K = (K_N + beta * n_clusters_tensor).clamp(K_N, K_M).long()
         return K, n_clusters_tensor
@@ -415,17 +413,17 @@ class DeFE(nn.Module):
         eps: float = 6.0
     ):
         """
-        返回：
-          D_pred: [B,1,H,W] 归一化密度图 (H,W = out_size)
-          K:      [B]       基于密度图的查询数估计（GPU-only）
+        Returns:
+          D_pred: [B,1,H,W] Normalized density map regressed by DaFE (H,W = out_size)
+          K:      [B]       Dynamic query budget K estimated by PAQI based on density
         """
-        # 密度图
+        # Density Map Regression (DaFE)
         x = self.dilated_convs(x)
         x = x * self.channel_attn(x)
         x = self.density_head(x)
         D_pred = F.interpolate(x, size=self.out_size, mode='bilinear', align_corners=False).sigmoid()
 
-        # 估计查询数
+        # Estimate Dynamic Query Budget (PAQI)
         K, _ = self._estimate_queries_gpu(D_pred, K_N=K_N, K_M=K_M, q=q, down=down, grid_eps=int(round(eps)), beta=beta)
         return D_pred, K
 
@@ -433,7 +431,7 @@ class DeFE(nn.Module):
 # RTDETR Decoder (optimized)
 # ------------------------------------------------------------------------------------------------
 class RTDETRDecoder(nn.Module):
-    export = False  # export mode   ← 新增这一行
+    export = False  # export mode   ← Added line
     def __init__(self, nc=80, ch=(512, 1024, 2048), hd=256, nq=300, ndp=4, nh=8, ndl=6,
                  d_ffn=1024, dropout=0.0, act=nn.ReLU(), eval_idx=-1,
                  nd=100, label_noise_ratio=0.5, box_noise_scale=1.0, learnt_init_query=False):
@@ -482,12 +480,12 @@ class RTDETRDecoder(nn.Module):
             attn_mask=attn_mask
         )
 
-        # 训练：固定 5 元素（不要多、不要少）
+        # Training phase: Return exactly 5 elements (no more, no less)
         x = (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
         if self.training:
             return x
 
-        # 验证/推理：返回 (y, x)，其中 x 仍然是 5 元素
+        # Validation/Inference phase: Return (y, x), where x remains 5 elements
         y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
         return y if self.export else (y, x)
 
@@ -529,7 +527,7 @@ class RTDETRDecoder(nn.Module):
         enc_scores = self.enc_score_head(features)
         enc_obj = enc_scores.max(-1).values
 
-        # 动态 query 数
+        # PAQI: Dynamically set the maximum query count based on budget K
         if K is not None:
             K = K.clamp_min(1)
             k_max = int(K.max().item())
@@ -544,15 +542,16 @@ class RTDETRDecoder(nn.Module):
         enc_bboxes = refer_bbox.sigmoid()
         enc_scores = enc_scores[b_idx, topk_idx]
 
-        # 构造 attn_mask 屏蔽超出 K 的位置
+        # PAQI: Construct an attention mask to actively eliminate computational redundancy
+        # by masking out query positions that exceed the dynamic budget K
         attn_mask = None
         if K is not None:
             mask = torch.arange(k_max, device=device)[None, :].expand(bs, -1) >= K[:, None]
-            # 构造 attn_mask 屏蔽超出 K 的位置
+            # Construct attn_mask to eliminate computational redundancy for queries exceeding budget K
             attn_mask = None
             if K is not None:
                 mask = torch.arange(k_max, device=device)[None, :].expand(bs, -1) >= K[:, None]
-                # [B, 1, 1, k_max] -> [B, heads, k_max, k_max]
+                # Map mask dimensions: [B, 1, 1, k_max] -> [B, heads, k_max, k_max]
                 mask = mask[:, None, None, :].expand(bs, self.nhead, k_max, k_max)
                 attn_mask = mask.reshape(bs * self.nhead, k_max, k_max)
 
